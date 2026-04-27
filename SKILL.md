@@ -47,7 +47,7 @@ scripts/cdp.mjs eval <target> <expr>
 
 ### Network capture & replay
 
-Network requests are automatically captured when a tab daemon starts. Use these commands to inspect and replay API calls:
+Network & WebSocket traffic is automatically captured when a tab daemon starts.
 
 ```bash
 scripts/cdp.mjs netlog    <target> [filter]       # list captured requests (filter by URL keyword)
@@ -55,9 +55,21 @@ scripts/cdp.mjs netdetail <target> <reqId>         # full request/response heade
 scripts/cdp.mjs netclear  <target>                 # clear captured request log
 scripts/cdp.mjs cookie    <target> [name]          # list all cookies or get a specific one
 scripts/cdp.mjs replay    <target> <reqId> [json]  # replay request with optional overrides
+scripts/cdp.mjs export    <target> [file]          # export captured requests as HAR file
+scripts/cdp.mjs diff      <target> <id1> <id2>     # compare two captured requests
+scripts/cdp.mjs scope     <target> <pattern>       # add URL scope filter (* = wildcard)
+scripts/cdp.mjs scope     <target> list|off|remove <id>  # manage scope filters
 ```
 
-`<reqId>` is a request ID prefix from `netlog` output. Replay overrides are JSON: `{"url":"...","method":"POST","headers":{},"body":"..."}`. Replay uses `fetch()` in page context with `credentials: include`, so it inherits cookies automatically.
+`<reqId>` is a request ID prefix from `netlog`. Replay uses `fetch()` in page context with `credentials: include`, inheriting cookies automatically. Export produces HAR 1.2 format (importable by Chrome DevTools, Burp Suite, etc.). Scope filters limit `netlog` and `export` to matching URLs only.
+
+### WebSocket monitoring
+
+```bash
+scripts/cdp.mjs wslog     <target> [filter]       # list WebSocket connections
+scripts/cdp.mjs wsdetail  <target> <wsId>          # show frames for a connection
+scripts/cdp.mjs wsclear   <target>                 # clear WebSocket log
+```
 
 ### Interaction
 
@@ -111,6 +123,17 @@ scripts/cdp.mjs intercept <target> "*api*" '{"requestHeaders":{"Authorization":"
 # Unlock CORS
 scripts/cdp.mjs intercept <target> "*api*" '{"responseHeaders":{"Access-Control-Allow-Origin":"*"}}'
 ```
+
+### Encode/decode (no target needed)
+
+```bash
+scripts/cdp.mjs encode base64 "hello world"       # → aGVsbG8gd29ybGQ=
+scripts/cdp.mjs decode base64 aGVsbG8gd29ybGQ=    # → hello world
+scripts/cdp.mjs encode url "a=1&b=2"              # → a%3D1%26b%3D2
+scripts/cdp.mjs encode hex "hello"                 # → 68656c6c6f
+```
+
+Supported encodings: `base64`, `url`, `html`, `hex`.
 
 ### Advanced
 

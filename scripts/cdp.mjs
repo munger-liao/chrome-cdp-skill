@@ -712,6 +712,189 @@ async function pdfStr(cdp, sid, filePath, targetId) {
   return `PDF saved to ${out}`;
 }
 
+// --- Shared utilities ---
+
+function matchesGlob(url, pattern) {
+  const regex = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*/g, '.*')
+    .replace(/\?/g, '.');
+  return new RegExp(`^${regex}$`, 'i').test(url);
+}
+
+// --- WebSocket logging ---
+
+function wslogStr(wsLog, filter) {
+  const entries = [...wsLog.values()];
+  const filtered = filter
+    ? entries.filter(e => e.url.toLowerCase().includes(filter.toLowerCase()))
+    : entries;
+  if (filtered.length === 0) return filter ? `No WebSocket connections matching "${filter}"` : 'No WebSocket connections captured';
+  return filtered.map(e => {
+    const id = e.requestId.slice(0, 10).padEnd(10);
+    const status = e.closed ? 'closed' : 'open  ';
+    const cnt = `${e.frames.length} frames`.padEnd(12);
+    return `${id}  ${status}  ${cnt}  ${e.url.substring(0, 100)}`;
+  }).join('\n');
+}
+
+function wsdetailStr(wsLog, wsIdPrefix) {
+  if (!wsIdPrefix) throw new Error('WebSocket ID prefix required. Run "cdp wslog <target>" first.');
+  const allIds = [...wsLog.keys()];
+  const fullId = resolvePrefix(wsIdPrefix, allIds, 'WebSocket', 'Run "cdp wslog <target>".');
+  const ws = wsLog.get(fullId);
+  const lines = [];
+  lines.push(`=== WebSocket ${ws.requestId} ===`);
+  lines.push(`URL: ${ws.url}`);
+  lines.push(`Status: ${ws.closed ? 'closed' : 'open'}`);
+  lines.push(`Frames: ${ws.frames.length}\n`);
+  for (const f of ws.frames) {
+    const data = f.data.length > 300 ? f.data.substring(0, 300) + '...' : f.data;
+    lines.push(`${f.dir} ${data}`);
+  }
+  return lines.join('\n');
+}
+
+function wsclearStr(wsLog) {
+  const count = wsLog.size;
+  wsLog.clear();
+  return `Cleared ${count} WebSocket connection(s)`;
+}
+
+// --- Export (HAR format) ---
+
+async function exportStr(cdp, sid, entries, filePath) {
+  if (entries.length === 0) throw new Error('No requests to export');
+  const harEntries = [];
+  for (const e of entries) {
+    const reqHeaders = Object.entries(e.requestHeaders || {}).map(([name, value]) => ({ name, value }));
+    const resHeaders = Object.entries(e.responseHeaders || {}).map(([name, value]) => ({ name, value }));
+    let responseText = '';
+    try {
+      const { body, base64Encoded } = await cdp.send('Network.getResponseBody', { requestId: e.requestId }, sid);
+      responseText = base64Encoded ? Buffer.from(body, 'base64').toString() : body;
+    } catch {}
+    const entry = {
+      startedDateTime: e.wallTime ? new Date(e.wallTime * 1000).toISOString() : new Date().toISOString(),
+      time: 0,
+      request: {
+        method: e.method || 'GET', url: e.url, httpVersion: 'HTTP/1.1',
+        headers: reqHeaders, queryString: [], cookies: [],
+        headersSize: -1, bodySize: e.postData ? e.postData.length : 0,
+      },
+      response: {
+        status: e.status || 0, statusText: e.statusText || '', httpVersion: 'HTTP/1.1',
+        headers: resHeaders, cookies: [],
+        content: { size: responseText.length, mimeType: e.mimeType || 'text/plain', text: responseText },
+        redirectURL: '', headersSize: -1, bodySize: responseText.length,
+      },
+      cache: {}, timings: { send: -1, wait: -1, receive: -1 },
+    };
+    if (e.postData) {
+      entry.request.postData = {
+        mimeType: e.requestHeaders?.['content-type'] || e.requestHeaders?.['Content-Type'] || 'application/octet-stream',
+        text: e.postData,
+      };
+    }
+    try {
+      const url = new URL(e.url);
+      entry.request.queryString = [...url.searchParams].map(([name, value]) => ({ name, value }));
+    } catch {}
+    harEntries.push(entry);
+  }
+  const har = { log: { version: '1.2', creator: { name: 'cdp-cli', version: '1.0' }, entries: harEntries } };
+  const out = filePath || resolve(RUNTIME_DIR, `cdp-export-${Date.now()}.har`);
+  writeFileSync(out, JSON.stringify(har, null, 2));
+  return `Exported ${harEntries.length} request(s) to ${out}`;
+}
+
+// --- Diff two captured requests ---
+
+async function diffStr(cdp, sid, networkLog, id1Prefix, id2Prefix) {
+  if (!id1Prefix || !id2Prefix) throw new Error('Two request ID prefixes required');
+  const allIds = [...networkLog.keys()];
+  const fullId1 = resolvePrefix(id1Prefix, allIds, 'request');
+  const fullId2 = resolvePrefix(id2Prefix, allIds, 'request');
+  const e1 = networkLog.get(fullId1);
+  const e2 = networkLog.get(fullId2);
+  const lines = [];
+  lines.push(`=== Diff: ${e1.requestId.slice(0, 8)} vs ${e2.requestId.slice(0, 8)} ===\n`);
+
+  if (e1.url !== e2.url) { lines.push('URL:'); lines.push(`  - ${e1.url}`); lines.push(`  + ${e2.url}`); }
+  else lines.push(`URL: ${e1.url} (same)`);
+  if (e1.method !== e2.method) lines.push(`Method: - ${e1.method}  + ${e2.method}`);
+
+  function diffHeaders(h1, h2, label) {
+    const allKeys = new Set([...Object.keys(h1 || {}), ...Object.keys(h2 || {})]);
+    const diffs = [];
+    for (const k of allKeys) {
+      const v1 = (h1 || {})[k], v2 = (h2 || {})[k];
+      if (v1 !== v2) {
+        if (v1 && !v2) diffs.push(`  - ${k}: ${v1}`);
+        else if (!v1 && v2) diffs.push(`  + ${k}: ${v2}`);
+        else { diffs.push(`  - ${k}: ${v1}`); diffs.push(`  + ${k}: ${v2}`); }
+      }
+    }
+    if (diffs.length > 0) { lines.push(`\n${label}:`); lines.push(...diffs); }
+  }
+  diffHeaders(e1.requestHeaders, e2.requestHeaders, 'Request Headers diff');
+  if (e1.postData !== e2.postData) {
+    lines.push('\nRequest Body diff:');
+    if (e1.postData) lines.push(`  - ${e1.postData.substring(0, 500)}`);
+    if (e2.postData) lines.push(`  + ${e2.postData.substring(0, 500)}`);
+  }
+  if (e1.status !== e2.status) lines.push(`\nStatus: - ${e1.status}  + ${e2.status}`);
+  diffHeaders(e1.responseHeaders, e2.responseHeaders, 'Response Headers diff');
+
+  try {
+    const [b1, b2] = await Promise.all([
+      cdp.send('Network.getResponseBody', { requestId: fullId1 }, sid).catch(() => null),
+      cdp.send('Network.getResponseBody', { requestId: fullId2 }, sid).catch(() => null),
+    ]);
+    if (b1 && b2 && !b1.base64Encoded && !b2.base64Encoded) {
+      if (b1.body !== b2.body) {
+        lines.push('\nResponse Body diff:');
+        try {
+          const j1 = JSON.parse(b1.body), j2 = JSON.parse(b2.body);
+          const jKeys = new Set([...Object.keys(j1), ...Object.keys(j2)]);
+          for (const k of jKeys) {
+            const v1 = JSON.stringify(j1[k]), v2 = JSON.stringify(j2[k]);
+            if (v1 !== v2) { lines.push(`  "${k}": - ${(v1 || 'undefined').substring(0, 200)}`); lines.push(`  "${k}": + ${(v2 || 'undefined').substring(0, 200)}`); }
+          }
+        } catch { lines.push(`  - ${b1.body.substring(0, 300)}...`); lines.push(`  + ${b2.body.substring(0, 300)}...`); }
+      } else { lines.push('\nResponse Body: (same)'); }
+    }
+  } catch {}
+
+  return lines.join('\n');
+}
+
+// --- Encode/decode utility ---
+
+function codecStr(operation, encoding, text) {
+  if (operation === 'encode') {
+    switch (encoding) {
+      case 'base64': return Buffer.from(text).toString('base64');
+      case 'url': return encodeURIComponent(text);
+      case 'html': return text.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+      case 'hex': return Buffer.from(text).toString('hex');
+      default: throw new Error(`Unknown encoding: ${encoding}. Use: base64, url, html, hex`);
+    }
+  } else {
+    switch (encoding) {
+      case 'base64': return Buffer.from(text, 'base64').toString();
+      case 'url': return decodeURIComponent(text);
+      case 'html': return text.replace(/&(amp|lt|gt|quot|#39|#x27|#(\d+)|#x([0-9a-fA-F]+));/g, (m, name, dec, hex) => {
+        if (dec) return String.fromCharCode(parseInt(dec));
+        if (hex) return String.fromCharCode(parseInt(hex, 16));
+        return { amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'", '#x27': "'" }[name] || m;
+      });
+      case 'hex': return Buffer.from(text, 'hex').toString();
+      default: throw new Error(`Unknown encoding: ${encoding}. Use: base64, url, html, hex`);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Per-tab daemon
 // ---------------------------------------------------------------------------
@@ -753,6 +936,7 @@ async function runDaemon(targetId) {
       requestHeaders: params.request.headers,
       postData: params.request.postData || null,
       timestamp: params.timestamp,
+      wallTime: params.wallTime,
       type: params.type,
       status: null, statusText: null, responseHeaders: null, mimeType: null,
     });
@@ -767,6 +951,31 @@ async function runDaemon(targetId) {
       entry.mimeType = params.response.mimeType;
     }
   });
+
+  // WebSocket monitoring
+  const wsLog = new Map();
+  const MAX_WS = 100;
+
+  cdp.onEvent('Network.webSocketCreated', (params) => {
+    if (wsLog.size >= MAX_WS) wsLog.delete(wsLog.keys().next().value);
+    wsLog.set(params.requestId, { requestId: params.requestId, url: params.url || '', frames: [], closed: false });
+  });
+  cdp.onEvent('Network.webSocketFrameSent', (params) => {
+    const ws = wsLog.get(params.requestId);
+    if (ws && ws.frames.length < 500) ws.frames.push({ dir: '→', data: params.response.payloadData, opcode: params.response.opcode });
+  });
+  cdp.onEvent('Network.webSocketFrameReceived', (params) => {
+    const ws = wsLog.get(params.requestId);
+    if (ws && ws.frames.length < 500) ws.frames.push({ dir: '←', data: params.response.payloadData, opcode: params.response.opcode });
+  });
+  cdp.onEvent('Network.webSocketClosed', (params) => {
+    const ws = wsLog.get(params.requestId);
+    if (ws) ws.closed = true;
+  });
+
+  // Scope filtering
+  const scopePatterns = new Map();
+  let scopeNextId = 1;
 
   // Dialog auto-handling
   let dialogMode = null;
@@ -784,13 +993,7 @@ async function runDaemon(targetId) {
   const interceptRules = new Map();
   let interceptNextId = 1;
 
-  function matchesGlob(url, pattern) {
-    const regex = pattern
-      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-      .replace(/\*/g, '.*')
-      .replace(/\?/g, '.');
-    return new RegExp(`^${regex}$`, 'i').test(url);
-  }
+
 
   async function updateFetchPatterns() {
     if (interceptRules.size === 0) {
@@ -934,7 +1137,16 @@ async function runDaemon(targetId) {
         case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
         case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
         case 'evalraw': result = await evalRawStr(cdp, sessionId, args[0], args[1]); break;
-        case 'netlog': result = netlogStr(networkLog, args[0]); break;
+        case 'netlog': {
+          let log = networkLog;
+          if (scopePatterns.size > 0) {
+            log = new Map([...networkLog].filter(([, v]) =>
+              [...scopePatterns.values()].some(p => matchesGlob(v.url, p))
+            ));
+          }
+          result = netlogStr(log, args[0]);
+          break;
+        }
         case 'netdetail': result = await netdetailStr(cdp, sessionId, networkLog, args[0]); break;
         case 'netclear': result = netclearStr(networkLog); break;
         case 'cookie': result = await cookieStr(cdp, sessionId, args[0]); break;
@@ -963,6 +1175,41 @@ async function runDaemon(targetId) {
           }
           break;
         }
+        case 'wslog': result = wslogStr(wsLog, args[0]); break;
+        case 'wsdetail': result = wsdetailStr(wsLog, args[0]); break;
+        case 'wsclear': result = wsclearStr(wsLog); break;
+        case 'export': {
+          let entries = [...networkLog.values()];
+          if (scopePatterns.size > 0) {
+            entries = entries.filter(e =>
+              [...scopePatterns.values()].some(p => matchesGlob(e.url, p))
+            );
+          }
+          result = await exportStr(cdp, sessionId, entries, args[0]);
+          break;
+        }
+        case 'scope': {
+          const sub = args[0];
+          if (sub === 'list') {
+            if (scopePatterns.size === 0) { result = 'No scope patterns (showing all requests)'; break; }
+            result = [...scopePatterns.entries()].map(([id, p]) => `#${id}  ${p}`).join('\n');
+          } else if (sub === 'off') {
+            scopePatterns.clear();
+            result = 'Scope cleared (showing all requests)';
+          } else if (sub === 'remove') {
+            const id = parseInt(args[1]);
+            if (!scopePatterns.has(id)) throw new Error(`Scope #${id} not found`);
+            scopePatterns.delete(id);
+            result = `Scope #${id} removed`;
+          } else {
+            if (!sub) throw new Error('Pattern required. Usage: scope <pattern> | scope list | scope off');
+            const id = scopeNextId++;
+            scopePatterns.set(id, sub);
+            result = `Scope #${id} added: "${sub}"`;
+          }
+          break;
+        }
+        case 'diff': result = await diffStr(cdp, sessionId, networkLog, args[0], args[1]); break;
         case 'intercept': {
           const sub = args[0];
           if (sub === 'list') {
@@ -1179,8 +1426,16 @@ Usage: cdp <command> [args]
   netdetail <target> <reqId>        Full request/response headers + body
   netclear  <target>                Clear captured request log
   cookie    <target> [name]         List all cookies or get a specific one
-  replay    <target> <reqId> [json] Replay a captured request with optional overrides
-                                    JSON format: {"url","method","headers":{},"body":""}
+  replay    <target> <reqId> [json] Replay request with overrides: {"url","method","headers","body"}
+  export    <target> [file]         Export captured requests as HAR file
+  diff      <target> <id1> <id2>    Compare two captured requests side-by-side
+  scope     <target> <pattern>      Add URL scope filter (* = wildcard)
+  scope     <target> list|off|remove <id>  Manage scope filters
+
+  WEBSOCKET
+  wslog     <target> [filter]       List WebSocket connections
+  wsdetail  <target> <wsId>         Show frames for a WebSocket connection
+  wsclear   <target>                Clear WebSocket log
 
   INTERACTION
   click   <target> <selector>       Click an element by CSS selector
@@ -1205,6 +1460,10 @@ Usage: cdp <command> [args]
   intercept <target> remove <id>       Remove a rule by ID
   intercept <target> off               Clear all rules
 
+  ENCODE/DECODE (no target needed)
+  encode  <base64|url|html|hex> <text>  Encode text
+  decode  <base64|url|html|hex> <text>  Decode text
+
   ADVANCED
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
   open    [url]                     Open a new tab (default: about:blank)
@@ -1214,9 +1473,9 @@ Usage: cdp <command> [args]
 <reqId> is a request ID prefix from "cdp netlog".
 
 NETWORK CAPTURE
-  Network requests are automatically captured when a tab daemon starts.
-  Use netlog to browse, netdetail for full headers/body, replay to re-send
-  with modified parameters (inherits page cookies via credentials: include).
+  Network & WebSocket traffic is automatically captured when a daemon starts.
+  Use scope to filter by target URL patterns, export to save as HAR,
+  diff to compare two requests, replay to re-send with modified parameters.
 
 INTERCEPTION (via CDP Fetch domain)
   Rules match URL patterns (* = any chars). JSON fields:
@@ -1246,7 +1505,7 @@ const NEEDS_TARGET = new Set([
   'net','network','click','clickxy','type','loadall','evalraw',
   'netlog','netdetail','netclear','cookie','replay','wait',
   'scroll','hover','key','select','storage','sessionstorage','pdf','dialog',
-  'intercept',
+  'intercept','wslog','wsdetail','wsclear','export','scope','diff',
 ]);
 
 async function main() {
@@ -1285,6 +1544,19 @@ async function main() {
     writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
     console.log(`Opened new tab: ${targetId.slice(0, 8)}  ${url}`);
     console.log('Note: this tab will need "Allow debugging?" approval on first access.');
+    return;
+  }
+
+  // Encode/decode (no target needed)
+  if (cmd === 'encode' || cmd === 'decode') {
+    const encoding = args[0];
+    const text = args.slice(1).join(' ');
+    if (!encoding || !text) {
+      console.error(`Usage: cdp ${cmd} <base64|url|html|hex> <text>`);
+      process.exit(1);
+    }
+    try { console.log(codecStr(cmd, encoding, text)); }
+    catch (e) { console.error('Error:', e.message); process.exit(1); }
     return;
   }
 
