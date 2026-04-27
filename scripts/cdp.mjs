@@ -780,6 +780,104 @@ async function runDaemon(targetId) {
     }
   });
 
+  // Request interception via Fetch domain
+  const interceptRules = new Map();
+  let interceptNextId = 1;
+
+  function matchesGlob(url, pattern) {
+    const regex = pattern
+      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+      .replace(/\*/g, '.*')
+      .replace(/\?/g, '.');
+    return new RegExp(`^${regex}$`, 'i').test(url);
+  }
+
+  async function updateFetchPatterns() {
+    if (interceptRules.size === 0) {
+      try { await cdp.send('Fetch.disable', {}, sessionId); } catch {}
+      return;
+    }
+    const patterns = [];
+    for (const [, rule] of interceptRules) {
+      const hasReqMods = rule.requestHeaders || rule.requestUrl || rule.requestMethod || rule.requestBody;
+      const hasResMods = rule.responseStatus != null || rule.responseHeaders || rule.responseBody != null;
+      if (hasReqMods || (!hasReqMods && !hasResMods)) {
+        patterns.push({ urlPattern: rule.pattern, requestStage: 'Request' });
+      }
+      if (hasResMods) {
+        patterns.push({ urlPattern: rule.pattern, requestStage: 'Response' });
+      }
+    }
+    await cdp.send('Fetch.enable', { patterns }, sessionId);
+  }
+
+  cdp.onEvent('Fetch.requestPaused', async (params) => {
+    const { requestId, request, responseStatusCode, responseHeaders: pausedResHeaders } = params;
+    const isResponse = responseStatusCode != null;
+
+    let matched = null;
+    for (const [, rule] of interceptRules) {
+      if (matchesGlob(request.url, rule.pattern)) { matched = rule; break; }
+    }
+
+    try {
+      if (!matched) {
+        if (isResponse) await cdp.send('Fetch.continueResponse', { requestId }, sessionId);
+        else await cdp.send('Fetch.continueRequest', { requestId }, sessionId);
+        return;
+      }
+
+      if (isResponse) {
+        const hasResMods = matched.responseStatus != null || matched.responseHeaders || matched.responseBody != null;
+        if (!hasResMods) {
+          await cdp.send('Fetch.continueResponse', { requestId }, sessionId);
+          return;
+        }
+        let originalBody = '';
+        try {
+          const resp = await cdp.send('Fetch.getResponseBody', { requestId }, sessionId);
+          originalBody = resp.base64Encoded ? Buffer.from(resp.body, 'base64').toString() : resp.body;
+        } catch {}
+
+        let newHeaders = pausedResHeaders || [];
+        if (matched.responseHeaders) {
+          const hm = new Map(newHeaders.map(h => [h.name.toLowerCase(), h]));
+          for (const [k, v] of Object.entries(matched.responseHeaders)) hm.set(k.toLowerCase(), { name: k, value: String(v) });
+          newHeaders = [...hm.values()];
+        }
+
+        const body = matched.responseBody != null ? matched.responseBody : originalBody;
+        await cdp.send('Fetch.fulfillRequest', {
+          requestId,
+          responseCode: matched.responseStatus != null ? matched.responseStatus : responseStatusCode,
+          responseHeaders: newHeaders,
+          body: Buffer.from(body).toString('base64'),
+        }, sessionId);
+      } else {
+        const hasReqMods = matched.requestHeaders || matched.requestUrl || matched.requestMethod || matched.requestBody;
+        if (!hasReqMods) {
+          await cdp.send('Fetch.continueRequest', { requestId }, sessionId);
+          return;
+        }
+        const mods = { requestId };
+        if (matched.requestUrl) mods.url = matched.requestUrl;
+        if (matched.requestMethod) mods.method = matched.requestMethod;
+        if (matched.requestBody) mods.postData = Buffer.from(matched.requestBody).toString('base64');
+        if (matched.requestHeaders) {
+          const hm = new Map(Object.entries(request.headers || {}).map(([k, v]) => [k.toLowerCase(), { name: k, value: v }]));
+          for (const [k, v] of Object.entries(matched.requestHeaders)) hm.set(k.toLowerCase(), { name: k, value: String(v) });
+          mods.headers = [...hm.values()];
+        }
+        await cdp.send('Fetch.continueRequest', mods, sessionId);
+      }
+    } catch {
+      try {
+        if (isResponse) await cdp.send('Fetch.continueResponse', { requestId }, sessionId);
+        else await cdp.send('Fetch.continueRequest', { requestId }, sessionId);
+      } catch {}
+    }
+  });
+
   // Shutdown helpers
   let alive = true;
   function shutdown() {
@@ -862,6 +960,45 @@ async function runDaemon(targetId) {
             dialogMode = null; result = 'Dialog auto-handling disabled';
           } else {
             throw new Error('Usage: dialog accept|dismiss|auto-accept|auto-dismiss|off');
+          }
+          break;
+        }
+        case 'intercept': {
+          const sub = args[0];
+          if (sub === 'list') {
+            if (interceptRules.size === 0) { result = 'No active intercept rules'; break; }
+            result = [...interceptRules.entries()].map(([id, r]) => {
+              const mods = [];
+              if (r.requestHeaders) mods.push('reqHeaders');
+              if (r.requestUrl) mods.push('reqUrl');
+              if (r.requestMethod) mods.push('reqMethod');
+              if (r.requestBody) mods.push('reqBody');
+              if (r.responseStatus != null) mods.push('resStatus');
+              if (r.responseHeaders) mods.push('resHeaders');
+              if (r.responseBody != null) mods.push('resBody');
+              return `#${id}  ${r.pattern}  [${mods.join(', ') || 'passthrough'}]`;
+            }).join('\n');
+          } else if (sub === 'off') {
+            interceptRules.clear();
+            await updateFetchPatterns();
+            result = 'All intercept rules cleared';
+          } else if (sub === 'remove') {
+            const id = parseInt(args[1]);
+            if (!interceptRules.has(id)) throw new Error(`Rule #${id} not found`);
+            interceptRules.delete(id);
+            await updateFetchPatterns();
+            result = `Rule #${id} removed`;
+          } else {
+            if (!sub) throw new Error('URL pattern required');
+            let mods = {};
+            if (args[1]) {
+              try { mods = JSON.parse(args[1]); }
+              catch { throw new Error(`Invalid JSON: ${args[1]}`); }
+            }
+            const id = interceptNextId++;
+            interceptRules.set(id, { pattern: sub, ...mods });
+            await updateFetchPatterns();
+            result = `Intercept rule #${id} added for "${sub}"`;
           }
           break;
         }
@@ -1062,6 +1199,12 @@ Usage: cdp <command> [args]
   pdf     <target> [file]           Export page as PDF
   dialog  <target> <action>         Handle JS dialogs: accept|dismiss|auto-accept|auto-dismiss|off
 
+  INTERCEPTION
+  intercept <target> <pattern> [json]  Add intercept rule (see INTERCEPTION below)
+  intercept <target> list              List active rules
+  intercept <target> remove <id>       Remove a rule by ID
+  intercept <target> off               Clear all rules
+
   ADVANCED
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
   open    [url]                     Open a new tab (default: about:blank)
@@ -1074,6 +1217,17 @@ NETWORK CAPTURE
   Network requests are automatically captured when a tab daemon starts.
   Use netlog to browse, netdetail for full headers/body, replay to re-send
   with modified parameters (inherits page cookies via credentials: include).
+
+INTERCEPTION (via CDP Fetch domain)
+  Rules match URL patterns (* = any chars). JSON fields:
+    requestHeaders: {}     Merge into request headers
+    requestUrl: "..."      Replace request URL
+    requestMethod: "..."   Replace HTTP method
+    requestBody: "..."     Replace request body
+    responseStatus: 200    Replace response status code
+    responseHeaders: {}    Merge into response headers
+    responseBody: "..."    Replace response body
+  Example: intercept <t> "*api/user*" '{"responseBody":"{\"mock\":true}","responseStatus":200}'
 
 COORDINATE SYSTEM
   shot saves at native resolution: image px = CSS px × DPR.
@@ -1092,6 +1246,7 @@ const NEEDS_TARGET = new Set([
   'net','network','click','clickxy','type','loadall','evalraw',
   'netlog','netdetail','netclear','cookie','replay','wait',
   'scroll','hover','key','select','storage','sessionstorage','pdf','dialog',
+  'intercept',
 ]);
 
 async function main() {
@@ -1180,6 +1335,11 @@ async function main() {
   } else if (cmd === 'replay') {
     if (!cmdArgs[0]) { console.error('Error: request ID required'); process.exit(1); }
     if (cmdArgs.length > 2) cmdArgs[1] = cmdArgs.slice(1).join(' ');
+  } else if (cmd === 'intercept') {
+    // intercept <pattern> <json> — join json parts; or subcommands: list, off, remove <id>
+    if (cmdArgs[0] !== 'list' && cmdArgs[0] !== 'off' && cmdArgs[0] !== 'remove' && cmdArgs.length > 2) {
+      cmdArgs[1] = cmdArgs.slice(1).join(' ');
+    }
   }
 
   if ((cmd === 'nav' || cmd === 'navigate') && !cmdArgs[0]) {

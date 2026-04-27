@@ -85,6 +85,33 @@ scripts/cdp.mjs pdf            <target> [file]           # export page as PDF
 scripts/cdp.mjs dialog         <target> <action>         # handle JS dialogs: accept|dismiss|auto-accept|auto-dismiss|off
 ```
 
+### Request interception
+
+Intercept and modify in-flight requests/responses using the CDP Fetch domain:
+
+```bash
+scripts/cdp.mjs intercept <target> <urlPattern> [rulesJson]  # add intercept rule
+scripts/cdp.mjs intercept <target> list                       # list active rules
+scripts/cdp.mjs intercept <target> remove <id>                # remove a rule
+scripts/cdp.mjs intercept <target> off                        # clear all rules
+```
+
+`<urlPattern>` uses `*` as wildcard. Rules JSON fields:
+- **Request mods**: `requestHeaders`, `requestUrl`, `requestMethod`, `requestBody`
+- **Response mods**: `responseStatus`, `responseHeaders`, `responseBody`
+
+Examples:
+```bash
+# Mock an API response
+scripts/cdp.mjs intercept <target> "*api/user*" '{"responseBody":"{\"name\":\"test\"}","responseStatus":200}'
+
+# Inject auth header into all API requests
+scripts/cdp.mjs intercept <target> "*api*" '{"requestHeaders":{"Authorization":"Bearer xxx"}}'
+
+# Unlock CORS
+scripts/cdp.mjs intercept <target> "*api*" '{"responseHeaders":{"Access-Control-Allow-Origin":"*"}}'
+```
+
 ### Advanced
 
 ```bash
